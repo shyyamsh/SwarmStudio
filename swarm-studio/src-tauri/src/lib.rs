@@ -151,7 +151,7 @@ async fn install_system_dependency(dependency_id: String) -> Result<String, Stri
     println!("Installing system dependency via winget: {}", dependency_id);
     
     let args = match dependency_id.as_str() {
-        "vcredist" => vec!["install", "--id", "Microsoft.VCRedist.2015+.XP", "--silent", "--accept-source-agreements", "--accept-package-agreements"],
+        "vcredist" => vec!["install", "--id", "Microsoft.VCRedist.2015+.x64", "--silent", "--accept-source-agreements", "--accept-package-agreements"],
         "vulkan" => vec!["install", "--id", "LunarG.VulkanSDK", "--silent", "--accept-source-agreements", "--accept-package-agreements"],
         "cuda" => vec!["install", "--id", "Nvidia.CUDA", "--silent", "--accept-source-agreements", "--accept-package-agreements"],
         _ => return Err("Unknown dependency ID".to_string())

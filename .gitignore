@@ -4,6 +4,9 @@ venv/
 ENV/
 env/
 
+# Binary downloads and directories
+bin/
+
 # Embedded repositories kept separate
 gstack-geminicli/
 
