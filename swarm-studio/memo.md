@@ -1,18 +1,24 @@
-﻿# Swarm Studio - Developer Memo
+# Swarm Studio - Developer Memo
 
-## Current State (As of Phase 2 Completion)
-The project is a local offline multi-agent AI desktop app (LM Studio clone) with an 8GB VRAM target.
-- **Tech Stack:** Tauri, Rust, React, TypeScript, TailwindCSS v4.
-- **UI:** 3-pane War Room, Collapsible settings, Hardware sliders, VRAM budget calculator.
-- **Backend:** Rust native prober (sysinfo, 
-vml-wrapper) working and passing data to the frontend.
-- **Marketplace:** Dynamically fetches GGUF models from Hugging Face API, parses parameter size, estimates VRAM usage, supports pagination.
-- **Downloads:** Rust command download_llama_server scaffolded via eqwest.
+## Current State (Post-Stability & Git Sync)
+The project is a local offline multi-agent AI desktop app with a verified, clean Git baseline.
+
+- **Tech Stack:** Tauri 2.0, Rust, React 19, TypeScript, TailwindCSS v4.
+- **Git:** Root-level repository initialized and pushed to `shyyamsh/SwarmStudio`. Massive model files and build artifacts are ignored.
+- **Backend Stability:**
+  - **Extraction Engine:** Switched to native `tar` extraction for Windows 10/11, resolving PowerShell file locks.
+  - **Download Engine:** Implemented HTTP Range support for **resumable model downloads**. Added 3-attempt retries for server binaries.
+  - **Permissions:** Admin privileges are now requested only for **release builds**, ensuring a smooth, non-elevated development cycle.
+- **Hardware & Dependencies:**
+  - Smart detection for `vcredist`, `CUDA`, and `Vulkan` libraries before attempting installation.
+  - Automatic runtime target selection based on GPU probing (RTX 4060 detected).
+- **UI:** Verified stable build. Syntax errors (JSX/Braces) from previous automated refactors have been resolved and the file tail cleaned of metadata.
 
 ## Hand-off Instructions for Next Agent
-1. Read /memories/session/plan.md and /memories/repo/architecture_decisions.md for the full architectural blueprint.
-2. We are currently starting **Phase 3: Multi-Agent Engine & Memory Management**.
-3. **Immediate Tasks:**
-   - Integrate web-tree-sitter (WASM) in the React frontend via Web Workers for AST-aware diffing without blocking the UI.
-   - Implement Rust backend process orchestration (std::process::Command) to launch the downloaded llama-server.exe with --cache-type q8_0 (Supervisor) or 16 (Worker) and manage process termination (SIGTERM).
-   - Set up Server-Sent Events (SSE) in React to capture the streamed output from llama-server and render it in the Thought Process <details> block.
+1. Read /memories/repo/plan.md and /memories/repo/architecture_decisions.md for the full architectural blueprint.
+2. **Frontend Restoration:** `src/App.tsx` has been restored to a functional state. Note that the "Simulation Mode" fallback was removed to favor real server connectivity.
+3. **Onboarding Integration:** The next step is to safely re-integrate the `performReadinessCheck` and Onboarding UI without breaking the JSX structure. Use small, atomic edits.
+4. **Immediate Tasks:**
+   - Verify the `llama-server.exe` extraction path logic in `lib.rs` (absolute vs relative).
+   - Re-enable the hardware scan results in the Top Header for real-time monitoring.
+   - Begin **Phase 3: Multi-Agent Engine** (web-tree-sitter integration).
