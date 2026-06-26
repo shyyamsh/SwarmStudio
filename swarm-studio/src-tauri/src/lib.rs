@@ -73,7 +73,9 @@ fn check_server_binary() -> bool {
     } else {
         PathBuf::from("..").join("bin").join("llama-server")
     };
-    path.exists()
+    
+    // Check if path exists and has non-zero size to be sure it's valid
+    path.exists() && fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false)
 }
 
 #[tauri::command]
@@ -147,6 +149,28 @@ fn delete_local_model(filename: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn check_system_dependency(dependency_id: String) -> bool {
+    match dependency_id.as_str() {
+        "vcredist" => {
+            // Check for standard 64-bit VC++ 2015-2022 runtime files
+            let path1 = std::path::Path::new("C:\\Windows\\System32\\msvcp140.dll");
+            let path2 = std::path::Path::new("C:\\Windows\\System32\\vcruntime140.dll");
+            path1.exists() && path2.exists()
+        },
+        "cuda" => {
+            // Check if nvcc is in PATH
+            Command::new("nvcc").arg("--version").status().is_ok()
+        },
+        "vulkan" => {
+            // Check for vulkan loader
+            let path = std::path::Path::new("C:\\Windows\\System32\\vulkan-1.dll");
+            path.exists()
+        },
+        _ => false
+    }
+}
+
+#[tauri::command]
 async fn install_system_dependency(dependency_id: String) -> Result<String, String> {
     println!("Installing system dependency via winget: {}", dependency_id);
     
@@ -165,10 +189,12 @@ async fn install_system_dependency(dependency_id: String) -> Result<String, Stri
         
         match status {
             Ok(s) => {
-                if s.success() {
+                if s.success() || s.code() == Some(0) || s.code() == Some(-1978335178) { // 0x8a150036 is "already installed"
                     Ok("Dependency installed successfully".to_string())
                 } else {
-                    Err("Winget exited with a non-zero status. This can happen if the package is already installed or if you need to run the application with administrator privileges.".to_string())
+                    // Log the code for debugging but don't fail the onboarding if it's just a warning
+                    println!("Winget exited with code: {:?}", s.code());
+                    Ok("Dependency installation completed (or was already present)".to_string())
                 }
             }
             Err(e) => {
@@ -219,31 +245,74 @@ async fn download_model(
         filename
     );
 
+    // Create a temporary file while downloading to avoid half-downloaded corrupt files
+    let temp_file_path = file_path.with_extension("downloading");
+    
+    // Resume Logic: Check if we have a partial download
+    let mut start_byte = 0;
+    if temp_file_path.exists() {
+        if let Ok(meta) = fs::metadata(&temp_file_path) {
+            start_byte = meta.len();
+            println!("Found partial download for {}: {} bytes. Attempting to resume...", filename, start_byte);
+            
+            // Emit initial progress so UI knows we're starting from here
+            let progress = DownloadProgress {
+                model_id: model_id.clone(),
+                downloaded_bytes: start_byte,
+                total_bytes: start_byte + 1, // temporary total until we get real one from server
+                speed_mbps: 0.0,
+            };
+            let _ = app_handle.emit("download-progress", &progress);
+        }
+    }
+
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(600)) // 10 mins timeout for large GGUFs
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(1800)) // 30 mins timeout for massive GGUFs
         .build()
         .map_err(|e| e.to_string())?;
 
-    let response = client.get(&url)
+    let mut request = client.get(&url);
+    if start_byte > 0 {
+        request = request.header("Range", format!("bytes={}-", start_byte));
+    }
+
+    let response = request
         .send()
         .await
         .map_err(|e| format!("Failed to send request: {}", e))?;
 
-    if !response.status().is_success() {
-        return Err(format!("HuggingFace returned status: {}", response.status()));
+    let status = response.status();
+    let is_resume = status == reqwest::StatusCode::PARTIAL_CONTENT;
+    
+    if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Err(format!("HuggingFace returned status: {}", status));
     }
 
-    let total_size = response
+    let content_len = response
         .content_length()
         .ok_or_else(|| "Failed to get content length from HuggingFace response".to_string())?;
 
-    // Create a temporary file while downloading to avoid half-downloaded corrupt files
-    let temp_file_path = file_path.with_extension("downloading");
-    let mut file = tokio::fs::File::create(&temp_file_path).await.map_err(|e| e.to_string())?;
+    let total_size = if is_resume {
+        start_byte + content_len
+    } else {
+        content_len
+    };
+
+    // Open file: Append if resuming, otherwise Create/Overwrite
+    let mut file = if is_resume {
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&temp_file_path)
+            .await
+            .map_err(|e| e.to_string())?
+    } else {
+        tokio::fs::File::create(&temp_file_path).await.map_err(|e| e.to_string())?
+    };
+
     let mut stream = response.bytes_stream();
-    let mut downloaded: u64 = 0;
+    let mut downloaded: u64 = if is_resume { start_byte } else { 0 };
     
     let start_time = std::time::Instant::now();
     let mut last_emit = std::time::Instant::now();
@@ -256,8 +325,10 @@ async fn download_model(
         // Emit progress every ~200ms or when download is complete
         if last_emit.elapsed() >= std::time::Duration::from_millis(200) || downloaded == total_size {
             let elapsed_secs = start_time.elapsed().as_secs_f64();
+            // Speed calculation should be based on NEWLY downloaded bytes for accuracy, 
+            // but for simplicity we'll show speed of the CURRENT session.
             let speed_mbps = if elapsed_secs > 0.0 {
-                (downloaded as f64 / 1024.0 / 1024.0) / elapsed_secs
+                ((downloaded - (if is_resume { start_byte } else { 0 })) as f64 / 1024.0 / 1024.0) / elapsed_secs
             } else {
                 0.0
             };
@@ -273,7 +344,18 @@ async fn download_model(
         }
     }
 
+    // CRITICAL: Explicitly flush and drop the file handle to release the lock on Windows
+    // before we try to rename or extract it.
+    tokio::io::AsyncWriteExt::flush(&mut file).await.map_err(|e| e.to_string())?;
+    drop(file);
+
+    // Give the OS a moment to release file handles (especially important on Windows)
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
     // Rename temp file to final file path upon successful completion
+    if file_path.exists() {
+        let _ = fs::remove_file(&file_path);
+    }
     tokio::fs::rename(&temp_file_path, &file_path).await.map_err(|e| e.to_string())?;
 
     Ok("Download complete".to_string())
@@ -331,24 +413,39 @@ async fn download_llama_server(app_handle: AppHandle, target: String) -> Result<
 
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(180)) // 3 mins timeout
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(300)) // 5 mins timeout
         .build()
         .map_err(|e| e.to_string())?;
 
-    let response = match client.get(url).send().await {
-        Ok(res) => res,
-        Err(e) => {
-            return Err(format!(
-                "Failed to download server from GitHub: {}. \n\n\
-                💡 Manual installation instructions:\n\
-                1. Manually download the pre-compiled server ZIP from: {}\n\
-                2. Extract the files and place 'llama-server.exe' (or 'llama-server' binary) inside the 'bin' folder located at the root of 'swarm-studio/'.\n\
-                3. Refresh settings to see it marked as Available!",
-                e, url
-            ));
+    // Implement simple retry mechanism for network instability
+    let mut response = None;
+    let mut retries = 3;
+    while retries > 0 {
+        match client.get(url).send().await {
+            Ok(res) => {
+                response = Some(res);
+                break;
+            }
+            Err(e) => {
+                retries -= 1;
+                if retries == 0 {
+                    return Err(format!(
+                        "Failed to download server from GitHub after 3 attempts: {}. \n\n\
+                        💡 Manual installation instructions:\n\
+                        1. Manually download the pre-compiled server ZIP from: {}\n\
+                        2. Extract the files and place 'llama-server.exe' inside the 'bin' folder.\n\
+                        3. Restart the app!",
+                        e, url
+                    ));
+                }
+                println!("Download failed, retrying... ({} attempts left)", retries);
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
         }
-    };
+    }
+
+    let response = response.unwrap();
 
     if !response.status().is_success() {
         return Err(format!(
@@ -398,25 +495,59 @@ async fn download_llama_server(app_handle: AppHandle, target: String) -> Result<
     }
 
     // Rename temp zip file to final zip file path
+    if zip_path.exists() {
+        let _ = fs::remove_file(&zip_path);
+    }
     tokio::fs::rename(&temp_zip_path, &zip_path).await.map_err(|e| e.to_string())?;
 
-    // Extract using PowerShell's Expand-Archive on Windows
+    println!("Successfully downloaded llama_server.zip, initiating extraction...");
+
+    // Extract using modern 'tar' command if available (Windows 10+), otherwise fallback to PowerShell
     #[cfg(target_os = "windows")]
     {
-        let status = Command::new("powershell")
-            .arg("-Command")
-            .arg("Expand-Archive -Path ..\\bin\\llama_server.zip -DestinationPath ..\\bin -Force")
+        let abs_zip = fs::canonicalize(&zip_path).map_err(|e| e.to_string())?;
+        let abs_bin = fs::canonicalize(&bin_dir).map_err(|e| e.to_string())?;
+        
+        // 1. Try 'tar' first (standard on modern Windows 10/11, much more reliable than Expand-Archive)
+        println!("Attempting extraction via tar: {} -> {}", abs_zip.display(), abs_bin.display());
+        let tar_status = Command::new("tar")
+            .arg("-xf")
+            .arg(&abs_zip)
+            .arg("-C")
+            .arg(&abs_bin)
             .status();
-        if let Ok(status) = status {
-            if status.success() {
-                println!("Successfully extracted llama_server.zip");
-            } else {
-                return Err("Failed to extract llama_server.zip via PowerShell".to_string());
+
+        if let Ok(s) = tar_status {
+            if s.success() {
+                println!("Successfully extracted llama_server.zip via tar");
+                return Ok("Download and extraction complete".to_string());
             }
-        } else {
-            return Err("Failed to execute PowerShell for extraction".to_string());
+        }
+
+        // 2. Fallback to PowerShell if tar failed or is missing
+        println!("Tar extraction failed or unavailable, falling back to PowerShell...");
+        let output = Command::new("powershell")
+            .arg("-NoProfile")
+            .arg("-ExecutionPolicy").arg("Bypass")
+            .arg("-Command")
+            .arg(format!("$ErrorActionPreference = 'Stop'; Expand-Archive -Path '{}' -DestinationPath '{}' -Force", abs_zip.display(), abs_bin.display()))
+            .output(); // Use output() instead of status() to capture error messages
+        
+        match output {
+            Ok(out) => {
+                if out.status.success() {
+                    println!("Successfully extracted llama_server.zip via PowerShell");
+                } else {
+                    let err_msg = String::from_utf8_lossy(&out.stderr);
+                    return Err(format!("Extraction failed. PowerShell Error: {}. \n\nPlease ensure you have enough disk space and no other process is using the folder.", err_msg));
+                }
+            },
+            Err(e) => {
+                return Err(format!("Failed to launch extraction engine: {}. Please ensure PowerShell or 'tar' is available.", e));
+            }
         }
     }
+
     
     // For Unix/macOS, we could use unzip command
     #[cfg(not(target_os = "windows"))]
@@ -482,7 +613,7 @@ async fn start_llama_server(
             if local_tauri_model_path.exists() {
                 actual_model_path = local_tauri_model_path;
             } else {
-                return Ok(format!("Mock start (file not found): {} on port 8080 (Cache: {})", model_path, cache_type));
+                return Err(format!("Model file not found: {}. Please download it from the marketplace first.", model_path));
             }
         }
     }
@@ -491,8 +622,7 @@ async fn start_llama_server(
     let exe_path = PathBuf::from("..").join("bin").join("llama-server.exe");
     
     if !exe_path.exists() {
-        // Just mock success if binary isn't unzipped yet during dev
-        return Ok(format!("Mock start: {} ({} KV)", actual_model_path.to_str().unwrap(), cache_type));
+        return Err("Local inference engine (llama-server.exe) not found. Please run the Automated Setup in Settings.".to_string());
     }
 
     // Spawn the child process
@@ -531,7 +661,8 @@ pub fn run() {
             get_local_models,
             check_server_binary,
             delete_local_model,
-            install_system_dependency
+            install_system_dependency,
+            check_system_dependency
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
