@@ -363,11 +363,11 @@ async fn download_model(
 
 #[tauri::command]
 async fn download_llama_server(app_handle: AppHandle, target: String) -> Result<String, String> {
-    // Dynamically resolve URL based on hardware targets (CUDA, Vulkan, CPU AVX2)
+    // Dynamically resolve URL based on hardware targets (Latest Build b9821)
     let url = match target.as_str() {
-        "cuda" => "https://github.com/ggml-org/llama.cpp/releases/download/b4131/llama-b4131-bin-win-cuda-cu12.2.0-x64.zip",
-        "vulkan" => "https://github.com/ggml-org/llama.cpp/releases/download/b4131/llama-b4131-bin-win-vulkan-x64.zip",
-        _ => "https://github.com/ggml-org/llama.cpp/releases/download/b4131/llama-b4131-bin-win-avx2-x64.zip"
+        "cuda" => "https://github.com/ggml-org/llama.cpp/releases/download/b9821/llama-b9821-bin-win-cuda-12.4-x64.zip",
+        "vulkan" => "https://github.com/ggml-org/llama.cpp/releases/download/b9821/llama-b9821-bin-win-vulkan-x64.zip",
+        _ => "https://github.com/ggml-org/llama.cpp/releases/download/b9821/llama-b9821-bin-win-cpu-x64.zip"
     };
     
     // In a production app, we would resolve the AppData/Local path using tauri::AppHandle. 
@@ -569,6 +569,19 @@ async fn download_llama_server(app_handle: AppHandle, target: String) -> Result<
 }
 
 #[tauri::command]
+fn stop_server(state: State<'_, LlamaServerState>) -> Result<String, String> {
+    let mut process_guard = state.process.lock().unwrap();
+    if let Some(mut child) = process_guard.take() {
+        println!("Stopping llama-server process...");
+        let _ = child.kill();
+        let _ = child.wait();
+        Ok("Server stopped".to_string())
+    } else {
+        Ok("No server running".to_string())
+    }
+}
+
+#[tauri::command]
 async fn start_llama_server(
     model_path: String,
     role: String,
@@ -620,23 +633,35 @@ async fn start_llama_server(
 
     // The path to the executable (assuming we unzipped it into bin/)
     let exe_path = PathBuf::from("..").join("bin").join("llama-server.exe");
+    let bin_dir = PathBuf::from("..").join("bin");
     
     if !exe_path.exists() {
         return Err("Local inference engine (llama-server.exe) not found. Please run the Automated Setup in Settings.".to_string());
     }
 
-    // Spawn the child process
-    let child = Command::new(exe_path)
+    // Spawn the child process with the bin directory as the working directory
+    // This ensures Windows can find the required DLLs (llama.dll, ggml.dll, etc.)
+    let abs_model_path = fs::canonicalize(&actual_model_path)
+        .unwrap_or_else(|_| actual_model_path.clone())
+        .to_string_lossy()
+        .replace("\\\\?\\", ""); // Remove UNC prefix for Windows compatibility
+
+    println!("Starting llama-server with command:");
+    println!("{:?} -m {} -c {} -ngl {} --flash-attn on --port 8080", 
+        exe_path, abs_model_path, context_length, gpu_layers);
+
+    let child = Command::new(&exe_path)
+        .current_dir(&bin_dir)
         .arg("-m")
-        .arg(&actual_model_path)
+        .arg(&abs_model_path)
         .arg("-c")
         .arg(context_length.to_string())
         .arg("-ngl")
         .arg(gpu_layers.to_string())
-        .arg("--cache-type")
-        .arg(cache_type)
+        .arg("--flash-attn")
+        .arg("on")
         .arg("--port")
-        .arg("8080") // The frontend will communicate via localhost:8080/v1/chat/completions
+        .arg("8080")
         .spawn()
         .map_err(|e| format!("Failed to spawn llama-server: {}", e))?;
 
@@ -662,8 +687,47 @@ pub fn run() {
             check_server_binary,
             delete_local_model,
             install_system_dependency,
-            check_system_dependency
+            check_system_dependency,
+            web_search,
+            stop_server
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[tauri::command]
+async fn web_search(query: String) -> Result<String, String> {
+    println!("Web Search Command received for: {}", query);
+    
+    // Call the search.py script located in the project root
+    let search_script = std::path::PathBuf::from("..").join("..").join("search.py");
+    println!("Search script path: {:?}", search_script.canonicalize().unwrap_or(search_script.clone()));
+    
+    if !search_script.exists() {
+        println!("Error: Search script not found");
+        return Err("Search script not found in project root.".to_string());
+    }
+
+    let output = Command::new("python")
+        .arg(&search_script)
+        .arg(&query)
+        .output();
+
+    match output {
+        Ok(out) => {
+            if out.status.success() {
+                let res = String::from_utf8_lossy(&out.stdout).to_string();
+                println!("Search successful. Results length: {}", res.len());
+                Ok(res)
+            } else {
+                let err_msg = String::from_utf8_lossy(&out.stderr);
+                println!("Search failed: {}", err_msg);
+                Err(format!("Search script failed: {}", err_msg))
+            }
+        },
+        Err(e) => {
+            println!("Failed to execute python: {}", e);
+            Err(format!("Failed to execute python: {}", e))
+        }
+    }
 }

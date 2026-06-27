@@ -38,8 +38,8 @@ function App() {
   const [contextLength, setContextLength] = useState(4096);
 
   // Swarm Role Assignment State (Phase 2, Step 5)
-  const [selectedSupervisor, setSelectedSupervisor] = useState<string>("OLMoE-1B-7B-Instruct");
-  const [selectedWorkers, setSelectedWorkers] = useState<string[]>(["Qwen2.5-Coder-0.5B", "DeepSeek-Coder-1.3B"]);
+  const [selectedSupervisor, setSelectedSupervisor] = useState<string>("Llama-3.2-1B-Instruct-Q4_K_M.gguf");
+  const [selectedWorkers, setSelectedWorkers] = useState<string[]>([]);
 
   // Local Models state
   const [localModels, setLocalModels] = useState<{filename: string, size_mb: number}[]>([]);
@@ -56,6 +56,8 @@ function App() {
   const [messages, setMessages] = useState<{role: string, content: string}[]>([]);
   const [draftStream, setDraftStream] = useState("");
   const [isSwarmThinking, setIsSwarmThinking] = useState(false);
+  const [abortController, setAbortController] = useState<AbortController | null>(null);
+  const [searchContextUsed, setSearchContextUsed] = useState<string | null>(null);
 
   // Debate State (Phase 4)
   const [debateTopic, setDebateTopic] = useState("");
@@ -82,17 +84,18 @@ function App() {
         return {
           total_system_ram_mb: 16384,
           total_vram_mb: 8192,
-          gpu_name: "NVIDIA GeForce RTX 4070 (Mock Prober)",
+          gpu_name: "NVIDIA GeForce RTX 4060 (Laptop GPU)",
           has_nvidia_gpu: true
         } as unknown as T;
       }
       if (cmd === "check_server_binary") {
-        return false as unknown as T;
+        return true as unknown as T;
       }
       if (cmd === "get_local_models") {
         return [
           { filename: "Llama-3.2-1B-Instruct-Q4_K_M.gguf", size_mb: 1200 },
-          { filename: "Qwen2.5-Coder-0.5B-Instruct-Q8_0.gguf", size_mb: 600 }
+          { filename: "Gemma-3-1B-it-GLM-4.7-Flash-Heretic-Uncensored-Thinking_Q8_0.gguf", size_mb: 1800 },
+          { filename: "gemma-4-E4B-it-Q4_K_M.gguf", size_mb: 2400 }
         ] as unknown as T;
       }
       if (cmd === "download_llama_server") {
@@ -100,6 +103,9 @@ function App() {
       }
       if (cmd === "install_system_dependency") {
         return "Silent installation initiated successfully via winget!" as unknown as T;
+      }
+      if (cmd === "web_search") {
+        return "DuckDuckGo Results: Gemini 3 Flash is a multimodal model by Google. It is optimized for speed and long-context performance." as unknown as T;
       }
       return {} as T;
     } catch (e) {
@@ -128,19 +134,18 @@ function App() {
       // Update assigned models if they match the newly fetched ones
       if (models.length > 0) {
         const filenames = models.map(m => m.filename);
-        if (!filenames.includes(selectedSupervisor) && selectedSupervisor !== "None") {
-          // Find recommended supervisor
-          const recommended = filenames.find(f => f.toLowerCase().includes('olmoe') || f.toLowerCase().includes('7b') || f.toLowerCase().includes('8b'));
+        
+        // Dynamic initialization if current selection is "None"
+        if (selectedSupervisor === "None") {
+          // Find recommended supervisor: prefer MoE or instruct models
+          const recommended = filenames.find(f => f.toLowerCase().includes('llama') || f.toLowerCase().includes('olmoe') || f.toLowerCase().includes('7b') || f.toLowerCase().includes('8b'));
           if (recommended) setSelectedSupervisor(recommended);
           else setSelectedSupervisor(filenames[0]);
         }
         
-        const validWorkers = selectedWorkers.filter(w => filenames.includes(w) || w === "None");
-        if (validWorkers.length === 0) {
-          const recommended = filenames.filter(f => f.toLowerCase().includes('coder') || f.toLowerCase().includes('0.5b') || f.toLowerCase().includes('1.2b'));
+        if (selectedWorkers.length === 0) {
+          const recommended = filenames.filter(f => f !== selectedSupervisor && (f.toLowerCase().includes('coder') || f.toLowerCase().includes('1b') || f.toLowerCase().includes('gemma')));
           setSelectedWorkers(recommended.length > 0 ? recommended.slice(0, 2) : [filenames[0]]);
-        } else {
-          setSelectedWorkers(validWorkers);
         }
       }
     } catch (err) {
@@ -182,11 +187,12 @@ function App() {
 
   // Helper to check if an HF model matches any downloaded local model file (Phase 2, Requirement 1)
   function isModelDownloaded(modelId: string) {
-    const baseName = modelId.split('/').pop()?.toLowerCase().replace("-gguf", "");
-    if (!baseName) return false;
+    const parts = modelId.toLowerCase().split('/');
+    const repoName = parts[parts.length - 1].replace("-gguf", "").replace(".gguf", "");
+    
     return localModels.some(m => {
       const localLower = m.filename.toLowerCase();
-      return localLower.includes(baseName) || baseName.includes(localLower);
+      return localLower.includes(repoName) || repoName.includes(localLower.split('.')[0]);
     });
   }
 
@@ -219,6 +225,48 @@ function App() {
     if (lowerId.includes("llama-3.2-3b")) return "3B";
 
     return "Unknown Size";
+  }
+
+  function checkModelCompatibility(modelId: string, tags: string[]): { compatible: boolean, reason?: string } {
+    const lowerId = modelId.toLowerCase();
+    
+    // 1. Architecture Blacklist (based on engine build 4131)
+    if (lowerId.includes("gemma-4") || lowerId.includes("gemma4")) {
+      return { compatible: false, reason: "Architecture 'gemma4' not supported by build 4131" };
+    }
+    if (lowerId.includes("bitnet")) {
+      return { compatible: false, reason: "BitNet (1-bit) models require specialized builds" };
+    }
+    if (lowerId.includes("mamba")) {
+      return { compatible: false, reason: "Mamba architecture not supported in this build" };
+    }
+    if (lowerId.includes("grok-1")) {
+      return { compatible: false, reason: "Grok-1 is too large for local inference" };
+    }
+
+    // 2. VRAM Check (Heuristic)
+    if (hwInfo) {
+      const paramSize = extractParamSize(modelId, tags);
+      const estVram = estimateVram(paramSize);
+      if (estVram !== "?") {
+        const vramGb = parseFloat(estVram.split(' ')[0]);
+        const systemRamGb = hwInfo.total_system_ram_mb / 1024;
+        const availableVramGb = (hwInfo.total_vram_mb - 1500) / 1024;
+        
+        // If it can't even fit in System RAM, it's definitely incompatible
+        if (vramGb > systemRamGb * 0.9) {
+          return { compatible: false, reason: `Too large for System RAM (${vramGb}GB > ${systemRamGb.toFixed(1)}GB)` };
+        }
+        
+        // If it's much larger than VRAM, it will be extremely slow (CPU offloading)
+        // We'll allow up to 2x VRAM for "heavy" models, but filter out anything beyond that
+        if (vramGb > availableVramGb * 2.5) {
+           return { compatible: false, reason: `Requires ~${vramGb}GB VRAM (Significant CPU offloading would be too slow)` };
+        }
+      }
+    }
+
+    return { compatible: true };
   }
 
   function estimateVram(paramSize: string) {
@@ -264,15 +312,18 @@ function App() {
 
         const data = await response.json();
         
+        // Filter models based on compatibility
+        const filteredData = data.filter((m: HFModel) => checkModelCompatibility(m.id, m.tags).compatible);
+
         // Filter out exact duplicates based on ID before appending
         if (append) {
           setHfModels(prev => {
             const existingIds = new Set(prev.map(m => m.id));
-            const newUniqueModels = data.filter((m: HFModel) => !existingIds.has(m.id));
+            const newUniqueModels = filteredData.filter((m: HFModel) => !existingIds.has(m.id));
             return [...prev, ...newUniqueModels];
           });
         } else {
-          setHfModels(data);
+          setHfModels(filteredData);
         }
       }
     } catch (error) {
@@ -355,17 +406,56 @@ function App() {
   // Handle SSE Chat Streaming from local llama-server
   async function handleSendChat() {
     if (!chatInput.trim()) return;
+
+    // Abort previous if any
+    if (abortController) {
+      abortController.abort();
+    }
+
+    const newAbortController = new AbortController();
+    setAbortController(newAbortController);
     
     // Add user message to UI immediately
-    const newMessages = [...messages, { role: "user", content: chatInput }];
+    const userQuery = chatInput;
+    const newMessages = [...messages, { role: "user", content: userQuery }];
     setMessages(newMessages);
     setChatInput("");
     setIsSwarmThinking(true);
     setDraftStream("");
+    setSearchContextUsed(null);
 
     try {
+      // Phase 2, Step 6: Web Search Integration
+      let searchContext = "";
+      if (isWebSearchEnabled) {
+        setDraftStream("Searching the web for real-time context...");
+        try {
+          searchContext = await safeInvoke<string>("web_search", { query: userQuery });
+          setSearchContextUsed(searchContext);
+          setDraftStream(`Found context from web search:\n${searchContext.substring(0, 300)}...\n\nProcessing with LLM...`);
+        } catch (err) {
+          console.error("Web search failed:", err);
+          setDraftStream("Web search failed. Proceeding with local knowledge...");
+        }
+      }
+
+      // Inject Search Context if available
+      const finalMessages = [...newMessages];
+      if (searchContext) {
+        const lastIdx = finalMessages.length - 1;
+        finalMessages[lastIdx].content = `[WEB SEARCH CONTEXT]\n${searchContext}\n\n[USER QUERY]: ${userQuery}`;
+      }
+
       // Determine the model path to start dynamically
       let modelToLoad = selectedSupervisor;
+      
+      // Safety Check: Gemma 4 is currently unsupported by the engine
+      if (modelToLoad.toLowerCase().includes("gemma-4")) {
+        setDraftStream("⚠️ Architecture Error: Gemma 4 is currently not supported by the local inference engine (build 4131). \n\nPlease select Llama 3.2 or Gemma 3 instead.");
+        setIsSwarmThinking(false);
+        return;
+      }
+
       if (modelToLoad === "None" || modelToLoad === "OLMoE-1B-7B-Instruct") {
         modelToLoad = "models/olmoe.gguf"; // default fallback path
       } else if (!modelToLoad.startsWith("models/")) {
@@ -373,6 +463,7 @@ function App() {
       }
 
       // 1. Trigger Rust Backend to ensure the correct model is loaded (dynamic selection)
+      setDraftStream("Booting model into VRAM...");
       const res = await safeInvoke<string>("start_llama_server", { 
         modelPath: modelToLoad, 
         role: "supervisor", 
@@ -382,25 +473,40 @@ function App() {
       console.log(res); // Logs the backend boot message
 
       // 2. Connect to the local llama-server via SSE with polling retry (since model loading takes 1-2 seconds)
+      setDraftStream("Connecting to inference engine...");
       let response: Response | null = null;
-      let retries = 10;
-      let delay = 400;
+      let retries = 60; // Increased to 60 (30 seconds total) for slow local model initialization
+      let delay = 500;
+
+      // In browser/mock mode, we simulate the fetch succeeding if serverStatus is Available
+      if (typeof window !== 'undefined' && !((window as any).__TAURI_INTERNALS__ || (window as any).__TAURI__)) {
+        if (serverStatus === "Available") {
+          console.log("Mocking successful connection to llama-server...");
+          // Simulate a short delay for "connecting"
+          await new Promise(resolve => setTimeout(resolve, 800));
+          // Throw to enter the simulation fallback but with "Live" flavor
+          throw new Error("MOCK_SUCCESS_VIA_SIMULATION");
+        }
+      }
 
       while (retries > 0) {
+        if (newAbortController.signal.aborted) throw new Error("AbortError");
         try {
           response = await fetch("http://localhost:8080/v1/chat/completions", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              messages: newMessages,
+              messages: finalMessages,
               stream: true,
               temperature: 0.7
-            })
+            }),
+            signal: newAbortController.signal
           });
           if (response.ok) {
             break; // Connection succeeded!
           }
-        } catch (e) {
+        } catch (e: any) {
+          if (e.name === 'AbortError') throw e;
           console.warn(`Connection to llama-server port 8080 failed. Retrying... (${retries} attempts left)`);
           retries--;
           if (retries === 0) {
@@ -442,18 +548,32 @@ function App() {
       setMessages([...newMessages, { role: "assistant", content: fullDraft }]);
       setDraftStream("");
       setIsSwarmThinking(false);
+      setAbortController(null);
 
-    } catch (error) {
-      console.warn("Local llama-server offline, triggering Swarm Simulation fallback:", error);
+    } catch (error: any) {
+      if (error.name === 'AbortError' || error.message === 'AbortError') {
+        console.log("Chat aborted by user");
+        setIsSwarmThinking(false);
+        setDraftStream("");
+        setAbortController(null);
+        return;
+      }
+      const isMockSuccess = error?.message === "MOCK_SUCCESS_VIA_SIMULATION";
+      if (!isMockSuccess) {
+        console.warn("Local llama-server offline, triggering Swarm Simulation fallback:", error);
+      }
       
       // Simulate Swarm Thought Process streamingly
-      setDraftStream("Booting supervisor node...\n");
+      setDraftStream(isWebSearchEnabled ? "Analyzing web context via Supervisor...\n" : "Booting supervisor node...\n");
       const savedInput = newMessages[newMessages.length - 1]?.content || "hi";
       
       setTimeout(() => {
-        setDraftStream("Supervisor evaluated routing rules. Routing task to Worker Node (Qwen2.5-Coder-0.5B)...\n\n[Worker Node 1]: Initializing draft...\n");
+        setDraftStream((isWebSearchEnabled ? "[Supervisor]: Combined web context with internal logic.\n" : "") + "Supervisor evaluated routing rules. Routing task to Worker Node (Qwen2.5-Coder-0.5B)...\n\n[Worker Node 1]: Initializing draft...\n");
         
-        const mockDraft = `// Here is a quick response to help you:
+        const mockDraft = isWebSearchEnabled 
+          ? `// I've incorporated search results to help you:
+console.log("Web context processed: ${userQuery}");`
+          : `// Here is a quick response to help you:
 console.log("Hello from Swarm Worker Node!");`;
         
         let currentText = "";
@@ -463,7 +583,7 @@ console.log("Hello from Swarm Worker Node!");`;
         const interval = setInterval(() => {
           if (i < mockDraft.length) {
             currentText += mockDraft[i];
-            setDraftStream("Supervisor evaluated routing rules. Routing task to Worker Node (Qwen2.5-Coder-0.5B)...\n\n[Worker Node 1]: Initializing draft...\n" + currentText);
+            setDraftStream((isWebSearchEnabled ? "[Supervisor]: Combined web context with internal logic.\n" : "") + "Supervisor evaluated routing rules. Routing task to Worker Node (Qwen2.5-Coder-0.5B)...\n\n[Worker Node 1]: Initializing draft...\n" + currentText);
             i++;
           } else {
             clearInterval(interval);
@@ -473,7 +593,11 @@ console.log("Hello from Swarm Worker Node!");`;
             
             // Append final message after approval
             setTimeout(() => {
-              const supervisorReply = `Hello! I am your MoE Supervisor. I've routed your message ("${savedInput}") through our specialized micro-model swarm. 
+              const supervisorReply = isMockSuccess 
+                ? `Hello! I am your MoE Supervisor. I've processed your request through the ${selectedSupervisor} model. 
+
+(Note: You are running in a browser environment, so I am simulating the live inference response for development purposes. In the Tauri desktop app, this is handled by the actual llama-server.)`
+                : `Hello! I am your MoE Supervisor. I've routed your message ("${savedInput}") through our specialized micro-model swarm. 
 
 Since the local server is currently offline or the model is still downloading, I've run this in offline simulation mode. Once your models are fully downloaded from the marketplace, the live local inference server will take over seamlessly! 
 
@@ -704,16 +828,12 @@ Is there anything specific you would like us to plan, design, or write today?`;
           </h1>
           <div className="ml-auto flex items-center space-x-4 text-xs font-mono text-zinc-400">
             {hwInfo && (
-              <>
-                <div className="flex items-center space-x-1" title="System RAM">
-                  <HardDrive size={14} />
-                  <span>{(hwInfo.total_system_ram_mb / 1024).toFixed(1)} GB RAM</span>
-                </div>
-                <div className="flex items-center space-x-1" title={`GPU: ${hwInfo.gpu_name}`}>
-                  <Cpu size={14} className={hwInfo.has_nvidia_gpu ? "text-green-500" : "text-zinc-400"} />
-                  <span>{(hwInfo.total_vram_mb / 1024).toFixed(1)} GB VRAM</span>
-                </div>
-              </>
+              <div className="flex items-center space-x-2 px-3 py-1 bg-zinc-800/50 rounded-full border border-zinc-700/50" title={`GPU: ${hwInfo.gpu_name}`}>
+                <Cpu size={14} className={hwInfo.has_nvidia_gpu ? "text-green-500 animate-pulse shadow-[0_0_10px_rgba(34,197,94,0.3)]" : "text-zinc-400"} />
+                <span className="max-w-[150px] truncate text-zinc-200 font-bold">{hwInfo.gpu_name}</span>
+                <span className="text-zinc-600 font-light mx-1">|</span>
+                <span className="text-purple-400 font-mono">{(hwInfo.total_vram_mb / 1024).toFixed(1)} GB VRAM</span>
+              </div>
             )}
             
             {/* Toggle Settings Panel Button */}
@@ -765,14 +885,24 @@ Is there anything specific you would like us to plan, design, or write today?`;
                   
                   {/* Thought Process (Streaming Draft) */}
                   {isSwarmThinking && (
-                    <details open className="mt-8 bg-zinc-900 border border-zinc-800 rounded-lg p-3 text-sm text-zinc-400 cursor-pointer shadow-sm">
-                      <summary className="font-semibold text-purple-400 hover:text-purple-300 select-none flex items-center gap-2">
-                        <span className="animate-pulse">●</span> Swarm iterating (Worker Draft)...
-                      </summary>
-                      <div className="mt-3 pl-4 border-l-2 border-zinc-700 space-y-2 whitespace-pre-wrap">
-                        {draftStream || <span className="text-zinc-600 italic">Booting model into VRAM...</span>}
-                      </div>
-                    </details>
+                    <div className="space-y-3 mt-4">
+                      {searchContextUsed && (
+                        <div className="bg-purple-900/10 border border-purple-500/20 p-3 rounded-lg text-[10px] font-mono text-purple-300 max-h-40 overflow-y-auto custom-scrollbar animate-in fade-in slide-in-from-bottom-2 duration-500 shadow-[inset_0_0_20px_rgba(0,0,0,0.2)]">
+                           <div className="flex items-center gap-2 mb-2 font-bold uppercase tracking-widest text-purple-400 border-b border-purple-800/30 pb-1">
+                              <Globe size={12} className="animate-spin" /> Web Search Context Injected
+                           </div>
+                           {searchContextUsed}
+                        </div>
+                      )}
+                      <details open className="bg-zinc-900 border border-zinc-800 rounded-lg p-3 text-sm text-zinc-400 cursor-pointer shadow-sm">
+                        <summary className="font-semibold text-purple-400 hover:text-purple-300 select-none flex items-center gap-2">
+                          <span className="animate-pulse">●</span> Swarm iterating (Worker Draft)...
+                        </summary>
+                        <div className="mt-3 pl-4 border-l-2 border-zinc-700 space-y-2 whitespace-pre-wrap">
+                          {draftStream || <span className="text-zinc-600 italic">Booting model into VRAM...</span>}
+                        </div>
+                      </details>
+                    </div>
                   )}
                 </div>
                 
@@ -794,18 +924,32 @@ Is there anything specific you would like us to plan, design, or write today?`;
                   <div className="absolute right-2 bottom-2 flex items-center space-x-2">
                     <button 
                       onClick={() => setIsWebSearchEnabled(!isWebSearchEnabled)}
-                      className={`p-2 rounded-lg transition-colors ${isWebSearchEnabled ? 'bg-purple-600/20 text-purple-400' : 'text-zinc-400 hover:bg-zinc-800'}`}
+                      className={`p-2 rounded-lg transition-colors ${isWebSearchEnabled ? 'bg-purple-600/20 text-purple-400 border border-purple-500/30 shadow-[0_0_10px_rgba(147,51,234,0.3)]' : 'text-zinc-400 hover:bg-zinc-800'}`}
                       title={isWebSearchEnabled ? "Web Search Active" : "Enable Web Search"}
                     >
-                      <Globe size={18} />
+                      <Globe size={18} className={isWebSearchEnabled ? "animate-pulse" : ""} />
                     </button>
-                    <button 
-                      onClick={handleSendChat}
-                      disabled={isSwarmThinking || !chatInput.trim()}
-                      className="p-2 bg-purple-600 hover:bg-purple-500 disabled:bg-zinc-800 text-white disabled:text-zinc-500 rounded-lg transition-colors shadow-md"
-                    >
-                      <SendHorizontal size={18} />
-                    </button>
+                    {isSwarmThinking ? (
+                      <button 
+                        onClick={async () => {
+                          abortController?.abort();
+                          await safeInvoke("stop_server");
+                        }}
+                        className="p-2 bg-red-600/20 hover:bg-red-600/30 text-red-400 rounded-lg transition-all border border-red-500/30 flex items-center gap-2 px-3 group active:scale-95 shadow-[0_0_15px_rgba(239,68,68,0.2)]"
+                        title="Stop Generation"
+                      >
+                        <PanelRightClose size={18} className="group-hover:rotate-90 transition-transform duration-300" />
+                        <span className="text-[10px] font-black uppercase tracking-tighter">Halt</span>
+                      </button>
+                    ) : (
+                      <button 
+                        onClick={handleSendChat}
+                        disabled={!chatInput.trim()}
+                        className="p-2 bg-purple-600 hover:bg-purple-500 disabled:bg-zinc-800 text-white disabled:text-zinc-500 rounded-lg transition-colors shadow-md"
+                      >
+                        <SendHorizontal size={18} />
+                      </button>
+                    )}
                   </div>
                 </div>
               </>
@@ -925,9 +1069,15 @@ Is there anything specific you would like us to plan, design, or write today?`;
                         const paramSize = extractParamSize(model.id, model.tags);
                         const estimatedVram = estimateVram(paramSize);
                         const progress = downloadProgress[model.id];
+                        const { compatible, reason } = checkModelCompatibility(model.id, model.tags);
 
                         return (
-                          <div key={model.id} className="bg-zinc-900/80 border border-zinc-800 p-5 rounded-xl hover:border-purple-500/50 transition-colors flex flex-col h-full shadow-sm">
+                          <div key={model.id} className={`bg-zinc-900/80 border ${compatible ? 'border-zinc-800 hover:border-purple-500/50' : 'border-red-900/30 opacity-75'} p-5 rounded-xl transition-colors flex flex-col h-full shadow-sm relative`}>
+                            {!compatible && (
+                              <div className="absolute top-2 right-2 flex gap-1">
+                                <span className="text-[10px] bg-red-500/20 text-red-400 px-1.5 py-0.5 rounded border border-red-500/30 font-bold uppercase">Incompatible</span>
+                              </div>
+                            )}
                             <div className="flex justify-between items-start mb-2">
                               <h4 className="font-semibold text-zinc-100 truncate w-3/4 text-lg" title={model.id}>{model.id.split('/').pop()}</h4>
                               <span className="text-xs bg-purple-500/10 text-purple-400 px-2 py-1 rounded shrink-0 font-mono" title="Quantized Format">GGUF</span>
@@ -939,6 +1089,9 @@ Is there anything specific you would like us to plan, design, or write today?`;
                                 <span className="text-xs font-mono bg-zinc-800 px-1.5 py-0.5 rounded border border-zinc-700">{paramSize}</span>
                                 <span className="text-xs text-zinc-500">Est. VRAM (Q4): <span className="text-zinc-300">{estimatedVram}</span></span>
                               </span>
+                              {!compatible && reason && (
+                                <span className="text-[10px] text-red-400/80 font-mono mt-1 italic">Reason: {reason}</span>
+                              )}
                             </div>
 
                             <div className="flex flex-wrap gap-2 mb-4">
@@ -1152,7 +1305,7 @@ Is there anything specific you would like us to plan, design, or write today?`;
                     <p className="text-xs text-zinc-500 mb-3">Target: 8GB VRAM graphics card. Dynamic budgeting ensures safety.</p>
                     <div className="space-y-2 text-sm text-zinc-400">
                       <div className="flex justify-between">
-                        <span>Total Available VRAM:</span>
+                        <span className="text-zinc-500">Total Available VRAM:</span>
                         <span className="font-semibold text-zinc-200">
                           {hwInfo ? (hwInfo.total_vram_mb / 1024).toFixed(1) : "0"} GB
                         </span>
@@ -1179,12 +1332,12 @@ Is there anything specific you would like us to plan, design, or write today?`;
                       </p>
                     </div>
                     {hwInfo && hwInfo.total_system_ram_mb < 32768 ? (
-                      <div className="bg-orange-500/10 border border-orange-500/20 text-orange-400 p-2.5 rounded-lg text-xs mt-2 leading-snug">
+                      <div className="bg-orange-500/10 border border-orange-500/20 text-orange-400 p-2.5 rounded-lg text-xs leading-snug">
                         ⚠️ **Notice: System has {(hwInfo.total_system_ram_mb/1024).toFixed(1)}GB RAM (&lt;32GB).** 
                         Process-level model switching during debates may take 3-5 seconds due to OS disk paging.
                       </div>
                     ) : (
-                      <div className="bg-green-500/10 border border-green-500/20 text-green-400 p-2.5 rounded-lg text-xs mt-2 leading-snug">
+                      <div className="bg-green-500/10 border border-green-500/20 text-green-400 p-2.5 rounded-lg text-xs leading-snug">
                         ✓ System has {hwInfo ? (hwInfo.total_system_ram_mb/1024).toFixed(1) : "0"}GB RAM. 
                         Meets the 32GB threshold. Swapping transitions will be instantaneous.
                       </div>

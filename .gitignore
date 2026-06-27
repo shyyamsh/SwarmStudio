@@ -6,6 +6,8 @@ env/
 
 # Binary downloads and directories
 bin/
+help.txt
+llama_server_debug.log
 
 # Embedded repositories kept separate
 gstack-geminicli/

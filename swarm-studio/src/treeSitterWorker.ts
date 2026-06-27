@@ -1,4 +1,4 @@
-﻿import * as Parser from 'web-tree-sitter';
+﻿import Parser from 'web-tree-sitter';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let parser: any = null;
@@ -10,10 +10,8 @@ self.onmessage = async (e) => {
     
     if (action === 'init') {
         try {
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            await (Parser as any).init();
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            parser = new (Parser as any)();
+            await Parser.init();
+            parser = new Parser();
             self.postMessage({ status: 'ready' });
         } catch (error) {
             self.postMessage({ status: 'error', error: String(error) });
